@@ -1,0 +1,283 @@
+/**
+ ESP-12E  (ESP8266) manejado desde IBM IoT
+ en funcion de la libreria (mqtt_Mosquitto o mqtt_Bluemix)
+ manda los datos a un servidor mqtt u otro
+ Morrastronics -- by chuRRuscat
+ v1.0 2017 initial version
+ v2.0 2018 mqtt & connectivity  functions separated
+*/
+
+#undef PRINT_SI
+//#define PRINT_SI
+#ifdef PRINT_SI
+  #define DPRINT(...)    Serial.print(__VA_ARGS__)
+  #define DPRINTLN(...)  Serial.println(__VA_ARGS__)
+#else
+  #define DPRINT(...)     //linea en blanco
+  #define DPRINTLN(...)   //linea en blanco
+#endif
+/*************************************************
+ ** -------- Valores Personalizados ----------- **
+ * *****************************************/
+//#include "Pruebas.h"
+//#include "salon.h"
+//#include "jardin.h"
+#include "terraza.h"
+#include "mqtt_mosquitto.h"
+/*************************************************
+ ** ----- Fin de Valores Personalizados ------- **
+ * ***********************************************/
+#define AJUSTA_T 10000 // para ajustar las esperas que hay en algunos sitios
+#define SDA D5   // para I2C del BME280
+#define SCL D6
+#define interruptPin D7 // PIN donde conectar el pluviómetro
+#define sensorPin    A0  // PIN analogico de Sensor humedad Suelo
+#define CONTROL_HUMEDAD D2  // base del transistor que enciende y apaga el sensor de humedad suelo
+#define L_POR_BALANCEO 0.312 // litros/m2 por cada balanceo
+#include <FS.h>
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BME280.h>
+#include <Pin_NodeMCU.h>
+#define SEALEVELPRESSURE_HPA (1013.25)
+#define A650MPRESSURE_HPA   (937)  //Po*e^(-0.000119*h) 
+#define PRESSURE_CORRECTION (1.080)  // HPAo/HPHh 647m
+
+#define BME280_ADDRESS   (0x76)   //IMPORTANTE, aveces viene como 0x77
+Adafruit_BME280 sensorBME280; 
+
+#define FICHEROVALORES "/metadata"
+#define JSONBUFFSIZE 250
+#define DATOSJSONSIZE 250
+
+volatile int contadorPluvi = 0; 
+// ********* Variables del sensor que expondremos ********** 
+float temperatura,humedadAire,presionHPa,lluvia=0,sensacion=20;
+int  humedadMin,humedadMax,humedadSuelo,humedadCrudo;
+int humedadCrudo1,humedadCrudo2;
+
+// otras variables
+int intervaloConex,umbralRiego, tRiego;
+char datosJson[DATOSJSONSIZE];
+
+void ICACHE_RAM_ATTR balanceoPluviometro() {
+  contadorPluvi++;
+}
+
+void setup() {
+boolean status;
+#ifdef PRINT_SI
+ Serial.begin(115200);
+#endif 
+ DPRINTLN("arranco"); 
+ Wire.begin(SDA,SCL);
+ status = sensorBME280.begin();  
+ if (!status) {
+   DPRINTLN("No consigo conectar el sensor BME!  ");    
+ }
+ pinMode(CONTROL_HUMEDAD,OUTPUT);
+ pinMode(interruptPin, INPUT_PULLUP);
+ attachInterrupt(digitalPinToInterrupt(interruptPin), balanceoPluviometro, FALLING);
+ SPIFFS.begin();
+ cargaValores();  // carga los valores que estan en SPIFFS
+ digitalWrite(CONTROL_HUMEDAD, HIGH);
+ espera(1000);
+ humedadCrudo1 = analogRead(sensorPin);
+ espera(1000);
+ humedadCrudo2 = analogRead(sensorPin);
+ digitalWrite(CONTROL_HUMEDAD, LOW);
+ wifiConnect();
+ mqttConnect();
+ delay(50);
+ initManagedDevice(); 
+ publicaDatos();
+}
+
+uint32_t ultima=0;
+
+void loop() {
+ DPRINT("*");
+ if (!loopMQTT()) {  // leo si hay mensajes de IoT y si tengo conexion    
+   DPRINTLN("He perdido la conexion,reconecto");
+   sinConectividad();        
+     mqttConnect();
+     initManagedDevice();  // Hay que suscribirse cada vez
+ } 
+ if ((millis()-ultima)>intervaloConex) {
+   DPRINT("intervalo:");DPRINT(intervaloConex);
+   DPRINT("\tmillis :");DPRINT(millis());
+   DPRINT("\tultima :");DPRINTLN(ultima);
+   publicaDatos();
+   ultima=millis();
+ }
+ espera(1000);
+}
+
+boolean tomaDatos (){
+  // Obtengo la temperatura y humedad
+  float bufTemp,bufTemp1,bufHumedad,bufHumedad1,bufPresion,bufPresion1;
+  boolean escorrecto=true; 
+  
+  bufHumedad= sensorBME280.readHumidity();
+  bufTemp= sensorBME280.readTemperature();
+  bufPresion=sensorBME280.readPressure()/100.0F;
+  /* activo el sensor de humedadsuelo*/
+  digitalWrite(CONTROL_HUMEDAD, HIGH);
+  espera(10000);
+  humedadCrudo = analogRead(sensorPin);
+  humedadCrudo=constrain(humedadCrudo,humedadMin,humedadMax);
+  digitalWrite(CONTROL_HUMEDAD, LOW);
+  // hago la media móvil de humedad suelo de los últimos tres valores 
+  humedadCrudo=(humedadCrudo1+humedadCrudo2+humedadCrudo)/3;
+  humedadCrudo2=humedadCrudo1;
+  humedadCrudo1=humedadCrudo;
+  // vuelvo a tomar humedad y temperatura
+  bufHumedad1= sensorBME280.readHumidity();
+  bufTemp1= sensorBME280.readTemperature();
+  bufPresion1= sensorBME280.readPressure()/100.0F;
+  DPRINTLN("tomo datos"); 
+  lluvia+=contadorPluvi*L_POR_BALANCEO;
+  detachInterrupt(digitalPinToInterrupt(interruptPin));
+  contadorPluvi=0;
+  attachInterrupt(digitalPinToInterrupt(interruptPin), balanceoPluviometro, FALLING);
+  if (humedadMin==humedadMax) humedadMax+=1; 
+  humedadSuelo = map(humedadCrudo,humedadMin,humedadMax,0,100);
+  if (isnan(bufHumedad) || isnan(bufTemp) || isnan(bufHumedad1) || isnan(bufTemp1) ) {       
+     DPRINTLN("no he podido leer del sensor !");       
+     escorrecto=false;
+  } else {
+  temperatura=(bufTemp+bufTemp1)/2;
+  humedadAire=(bufHumedad+bufHumedad1)/2;
+  presionHPa=(bufPresion+bufPresion1)/2*PRESSURE_CORRECTION;
+  if (temperatura>60) escorrecto=false;
+  if ((humedadAire>101)||(humedadAire<0)) escorrecto=false;    
+  DPRINT("\tTemperatura  ") ;DPRINT(temperatura);
+  DPRINT("\tHumedad aire  ");DPRINT(humedadAire);
+  DPRINT("\tPresion HPa   ");DPRINT(presionHPa);
+  DPRINT("\tHumedad  ")     ;DPRINT(humedadSuelo);
+  DPRINT("\tHumedad crudo ");DPRINTLN(humedadCrudo);  
+  } 
+  return escorrecto;
+}
+
+void publicaDatos() {
+  int k=0;
+  char signo;
+  boolean pubresult=true;  
+ 
+  while(!tomaDatos()) {   
+     espera(1000);
+     if(k++>30) {
+      return; 
+     }
+  }
+  // Preparo los datos en modo JSON.
+  if (temperatura<0) {
+    signo='-';
+    temperatura*=-1;
+  }  else signo=' ';
+  
+  sprintf(datosJson,"[{\"temp\":%c%d.%1d,\"hAire\":%d,\"hSuelo\":%d,\"hCrudo\":%d,\"HPa\":%d,\"l/m2\":%d.%1d},{\"deviceId\":\"%s\"}]",
+        signo,(int)temperatura, (int)(temperatura * 10.0) % 10,\
+        (int)humedadAire, (int) humedadSuelo,(int)humedadCrudo,(int)presionHPa,
+        (int)lluvia, (int)(lluvia * 10.0) % 10,DEVICE_ID);
+  // Publica los datos.
+  pubresult = enviaDatos(publishTopic,datosJson);
+  if (pubresult) 
+    {lluvia=0;}      // solo pongo la lluvia a cero si he conseguido enviar los datos 
+}
+
+void cargaValores() {
+  FSInfo fsInfo; 
+  boolean resultado;
+  StaticJsonBuffer<JSONBUFFSIZE> jsonBuffer;      
+  
+  /* si no habia nada, formateo, creo el fichero y pongo 
+   *  los valores por defecto en el fichero "metadata"mqtt_mosquitto.ino
+   */
+  
+  if (!SPIFFS.info(fsInfo)) {    
+    DPRINTLN(" formateo, y cargo valores por defecto");      
+    SPIFFS.format();
+    valoresPorDefecto();    
+  } else { 
+    if (SPIFFS.exists(FICHEROVALORES)) { // Si el fichero existe, cargo los valores
+      leeValores(FICHEROVALORES,datosJson);
+      DPRINT(" Parametros: "); DPRINTLN(datosJson);    
+    } else {       
+      DPRINTLN("NO NO EXISTE fichero de parametros");  // si no existe, grabo los valores por defecto
+      valoresPorDefecto();
+    }    
+  }
+  JsonObject& root = jsonBuffer.parseObject(datosJson);;
+  if (!root.success()) {  
+     DPRINTLN("CargaValores: FALLA PARSEADO DE LOS DATOS");
+     return;
+  }
+  JsonObject& metadata = root["metadata"];
+  intervaloConex=metadata.get<unsigned long>("intervaloConex");
+  umbralRiego=metadata.get<int>("umbralRiego");
+  tRiego=metadata.get<int>("tRiego");
+  humedadMin=metadata.get<int>("humedadMin");
+  humedadMax=metadata.get<int>("humedadMax");  
+  DPRINTLN("***** Valores leidos de SPIFFS:");  
+  DPRINT("intervaloConex:"); DPRINTLN(intervaloConex+AJUSTA_T);
+  DPRINT("tRiego:"); DPRINTLN(tRiego);
+  DPRINT("umbralRiego:"); DPRINTLN(umbralRiego);
+  DPRINT("humedadMin:"); DPRINTLN(humedadMin);
+  DPRINT("humedadMax:"); DPRINTLN(humedadMax);  
+}
+
+boolean leeValores(char * fichero, char * buff) {
+  File ficheroValores;
+  int tamanyo;
+  
+  ficheroValores= SPIFFS.open(fichero, "r+");
+  if (ficheroValores) {   
+    tamanyo=ficheroValores.size();
+    ficheroValores.readBytes(buff,tamanyo);
+    ficheroValores.close();
+    buff[tamanyo]=0;
+  }
+  else {
+    DPRINTLN("error al abrir el fichero de metadata para leer");
+    return false;
+  }
+   return true;
+}
+
+boolean escribeValores(char * fichero, char buff[]) {
+  File ficheroValores;
+
+  ficheroValores= SPIFFS.open(fichero, "w");
+  if (ficheroValores) {   
+    ficheroValores.println(buff);
+  }
+  else {
+    return false;
+  }
+  ficheroValores.close();
+  DPRINTLN("Escribe valores en SPIFFS:");  
+  DPRINT("intervaloConex:"); DPRINTLN(intervaloConex+AJUSTA_T);
+  DPRINT("tRiego:"); DPRINTLN(tRiego);
+  DPRINT("umbralRiego:"); DPRINTLN(umbralRiego);
+  DPRINT("humedadMin:"); DPRINTLN(humedadMin);
+  DPRINT("humedadMax:"); DPRINTLN(humedadMax);
+  return true;
+}
+
+void valoresPorDefecto() {
+  File ficheroValores;
+
+  tRiego=TRIEGO;
+  umbralRiego=UMBRALRIEGO;
+  intervaloConex=INTERVALO_CONEX;
+  humedadMin=HUMEDAD_MIN;  
+  humedadMax=HUMEDAD_MAX;
+  sprintf(datosJson,"{\"metadata\":{\"tRiego\":%d,\"intervaloConex\":%d,\"umbralRiego\":%d,\"humedadMin\":%d,\"humedadMax\":%d},\
+           \"supports\": {\"deviceActions\": true,\"firmwareActions\": true} }",
+         tRiego,intervaloConex,umbralRiego,humedadMin,humedadMax);
+  escribeValores(FICHEROVALORES,datosJson); 
+  DPRINT("Guardo por Defecto :");DPRINTLN(datosJson);
+  DPRINT("valores por defecto write ");DPRINTLN(ficheroValores.println(datosJson));
+}
